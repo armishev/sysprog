@@ -156,6 +156,9 @@ coro_bus_delete(struct coro_bus *bus)
 		if (bus->channels[i] != NULL)
 			channel_close(bus, i);
 	}
+	broadcast_wakeup_all(bus);
+	while (!rlist_empty(&bus->broadcast_wait))
+		coro_yield();
 	delete[] bus->channels;
 	delete bus;
 }
