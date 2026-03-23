@@ -1,76 +1,183 @@
 #include "thread_pool.h"
 
+#include <deque>
 #include <pthread.h>
+#include <vector>
 
 struct thread_task {
 	thread_task_f function;
-
-	/* PUT HERE OTHER MEMBERS */
+	pthread_mutex_t state_mu;
+	pthread_cond_t completion_cv;
+	bool ever_pushed;
+	bool attached_to_pool;
+	bool running_body;
+	bool execution_done;
+	bool join_completed;
 };
 
 struct thread_pool {
+	int max_threads;
 	std::vector<pthread_t> threads;
-
-	/* PUT HERE OTHER MEMBERS */
+	std::deque<thread_task *> queue;
+	pthread_mutex_t pool_mu;
+	pthread_cond_t work_cv;
+	bool shutdown;
+	int running;
 };
+
+static void *
+worker_main(void *arg)
+{
+	struct thread_pool *pool = static_cast<struct thread_pool *>(arg);
+
+	for (;;) {
+		pthread_mutex_lock(&pool->pool_mu);
+		while (!pool->shutdown && pool->queue.empty())
+			pthread_cond_wait(&pool->work_cv, &pool->pool_mu);
+		if (pool->shutdown && pool->queue.empty()) {
+			pthread_mutex_unlock(&pool->pool_mu);
+			return NULL;
+		}
+		struct thread_task *task = pool->queue.front();
+		pool->queue.pop_front();
+		pool->running++;
+		pthread_mutex_unlock(&pool->pool_mu);
+
+		pthread_mutex_lock(&task->state_mu);
+		task->running_body = true;
+		pthread_mutex_unlock(&task->state_mu);
+
+		task->function();
+
+		pthread_mutex_lock(&pool->pool_mu);
+		pool->running--;
+		pthread_mutex_unlock(&pool->pool_mu);
+
+		pthread_mutex_lock(&task->state_mu);
+		task->running_body = false;
+		task->execution_done = true;
+		task->attached_to_pool = false;
+		pthread_cond_broadcast(&task->completion_cv);
+		pthread_mutex_unlock(&task->state_mu);
+	}
+}
 
 int
 thread_pool_new(int thread_count, struct thread_pool **pool)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)thread_count;
-	(void)pool;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	if (thread_count <= 0 || thread_count > TPOOL_MAX_THREADS)
+		return TPOOL_ERR_INVALID_ARGUMENT;
+
+	struct thread_pool *p = new struct thread_pool();
+	p->max_threads = thread_count;
+	p->shutdown = false;
+	p->running = 0;
+	pthread_mutex_init(&p->pool_mu, NULL);
+	pthread_cond_init(&p->work_cv, NULL);
+	*pool = p;
+	return 0;
 }
 
 int
 thread_pool_delete(struct thread_pool *pool)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)pool;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	if (pool == NULL)
+		return 0;
+
+	pthread_mutex_lock(&pool->pool_mu);
+	if (!pool->queue.empty() || pool->running > 0) {
+		pthread_mutex_unlock(&pool->pool_mu);
+		return TPOOL_ERR_HAS_TASKS;
+	}
+	pool->shutdown = true;
+	pthread_cond_broadcast(&pool->work_cv);
+	pthread_mutex_unlock(&pool->pool_mu);
+
+	for (pthread_t th : pool->threads)
+		pthread_join(th, NULL);
+
+	pthread_mutex_destroy(&pool->pool_mu);
+	pthread_cond_destroy(&pool->work_cv);
+	delete pool;
+	return 0;
 }
 
 int
 thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)pool;
-	(void)task;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&pool->pool_mu);
+	if (pool->queue.size() + (size_t)pool->running >= TPOOL_MAX_TASKS) {
+		pthread_mutex_unlock(&pool->pool_mu);
+		return TPOOL_ERR_TOO_MANY_TASKS;
+	}
+
+	pthread_mutex_lock(&task->state_mu);
+	task->execution_done = false;
+	task->join_completed = false;
+	task->attached_to_pool = true;
+	task->ever_pushed = true;
+	pthread_mutex_unlock(&task->state_mu);
+
+	pool->queue.push_back(task);
+	pthread_cond_signal(&pool->work_cv);
+
+	if ((int)pool->threads.size() < pool->max_threads) {
+		pthread_t th;
+		if (pthread_create(&th, NULL, worker_main, pool) == 0)
+			pool->threads.push_back(th);
+	}
+
+	pthread_mutex_unlock(&pool->pool_mu);
+	return 0;
 }
 
 int
 thread_task_new(struct thread_task **task, const thread_task_f &function)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	(void)function;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	struct thread_task *t = new struct thread_task();
+	t->function = function;
+	pthread_mutex_init(&t->state_mu, NULL);
+	pthread_cond_init(&t->completion_cv, NULL);
+	t->ever_pushed = false;
+	t->attached_to_pool = false;
+	t->running_body = false;
+	t->execution_done = false;
+	t->join_completed = false;
+	*task = t;
+	return 0;
 }
 
 bool
 thread_task_is_finished(const struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	return false;
+	pthread_mutex_lock(const_cast<pthread_mutex_t *>(&task->state_mu));
+	bool r = task->execution_done && task->join_completed;
+	pthread_mutex_unlock(const_cast<pthread_mutex_t *>(&task->state_mu));
+	return r;
 }
 
 bool
 thread_task_is_running(const struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	return false;
+	pthread_mutex_lock(const_cast<pthread_mutex_t *>(&task->state_mu));
+	bool r = task->running_body;
+	pthread_mutex_unlock(const_cast<pthread_mutex_t *>(&task->state_mu));
+	return r;
 }
 
 int
 thread_task_join(struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&task->state_mu);
+	if (!task->ever_pushed) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+	while (!task->execution_done)
+		pthread_cond_wait(&task->completion_cv, &task->state_mu);
+	task->join_completed = true;
+	pthread_mutex_unlock(&task->state_mu);
+	return 0;
 }
 
 #if NEED_TIMED_JOIN
@@ -78,7 +185,6 @@ thread_task_join(struct thread_task *task)
 int
 thread_task_timed_join(struct thread_task *task, double timeout)
 {
-	/* IMPLEMENT THIS FUNCTION */
 	(void)task;
 	(void)timeout;
 	return TPOOL_ERR_NOT_IMPLEMENTED;
@@ -89,9 +195,17 @@ thread_task_timed_join(struct thread_task *task, double timeout)
 int
 thread_task_delete(struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&task->state_mu);
+	if (task->attached_to_pool) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_TASK_IN_POOL;
+	}
+	pthread_mutex_unlock(&task->state_mu);
+
+	pthread_mutex_destroy(&task->state_mu);
+	pthread_cond_destroy(&task->completion_cv);
+	delete task;
+	return 0;
 }
 
 #if NEED_DETACH
@@ -99,7 +213,6 @@ thread_task_delete(struct thread_task *task)
 int
 thread_task_detach(struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
 	(void)task;
 	return TPOOL_ERR_NOT_IMPLEMENTED;
 }
