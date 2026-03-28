@@ -13,7 +13,6 @@ struct thread_task {
 	pthread_mutex_t state_mu;
 	pthread_cond_t completion_cv;
 	bool ever_pushed;
-	bool attached_to_pool;
 	bool running_body;
 	bool execution_done;
 	bool join_completed;
@@ -45,6 +44,7 @@ struct thread_pool {
 	pthread_cond_t work_cv;
 	bool shutdown;
 	int running;
+	int threads_waiting;
 };
 
 static void *
@@ -54,8 +54,11 @@ worker_main(void *arg)
 
 	for (;;) {
 		pthread_mutex_lock(&pool->pool_mu);
+		pool->threads_waiting++;
 		while (!pool->shutdown && pool->queue.empty())
 			pthread_cond_wait(&pool->work_cv, &pool->pool_mu);
+		pool->threads_waiting--;
+
 		if (pool->shutdown && pool->queue.empty()) {
 			pthread_mutex_unlock(&pool->pool_mu);
 			return NULL;
@@ -78,7 +81,6 @@ worker_main(void *arg)
 		pthread_mutex_lock(&task->state_mu);
 		task->running_body = false;
 		task->execution_done = true;
-		task->attached_to_pool = false;
 		pthread_cond_broadcast(&task->completion_cv);
 #if NEED_DETACH
 		if (task->detached) {
@@ -108,6 +110,7 @@ thread_pool_new(int thread_count, struct thread_pool **pool)
 	p->max_threads = thread_count;
 	p->shutdown = false;
 	p->running = 0;
+	p->threads_waiting = 0;
 	pthread_mutex_init(&p->pool_mu, NULL);
 	pthread_cond_init(&p->work_cv, NULL);
 	*pool = p;
@@ -150,7 +153,6 @@ thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 	pthread_mutex_lock(&task->state_mu);
 	task->execution_done = false;
 	task->join_completed = false;
-	task->attached_to_pool = true;
 	task->ever_pushed = true;
 #if NEED_DETACH
 	task->detached = false;
@@ -160,7 +162,8 @@ thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 	pool->queue.push_back(task);
 	pthread_cond_signal(&pool->work_cv);
 
-	if ((int)pool->threads.size() < pool->max_threads) {
+	if (!pool->shutdown && pool->threads_waiting == 0 &&
+	    (int)pool->threads.size() < pool->max_threads) {
 		pthread_t th;
 		if (pthread_create(&th, NULL, worker_main, pool) == 0)
 			pool->threads.push_back(th);
@@ -178,7 +181,6 @@ thread_task_new(struct thread_task **task, const thread_task_f &function)
 	pthread_mutex_init(&t->state_mu, NULL);
 	pthread_cond_init(&t->completion_cv, NULL);
 	t->ever_pushed = false;
-	t->attached_to_pool = false;
 	t->running_body = false;
 	t->execution_done = false;
 	t->join_completed = false;
