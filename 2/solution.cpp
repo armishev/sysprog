@@ -18,24 +18,46 @@ reap_zombies(void)
 }
 
 static bool
-extract_pipeline(const struct command_line *line,
-		 std::vector<command> &pipeline_commands)
+parse_compound(const struct command_line *line,
+	       std::vector<std::vector<command>> &segments,
+	       std::vector<expr_type> &connectors)
 {
-	pipeline_commands.clear();
-	bool next_segment_must_be_command = true;
+	segments.clear();
+	connectors.clear();
+	std::vector<command> current_pipeline;
+	bool next_token_must_be_command = true;
+
 	for (const expr &e : line->exprs) {
-		if (next_segment_must_be_command) {
-			if (e.type != EXPR_TYPE_COMMAND)
+		switch (e.type) {
+		case EXPR_TYPE_COMMAND:
+			if (!next_token_must_be_command)
 				return false;
-			pipeline_commands.push_back(*e.cmd);
-			next_segment_must_be_command = false;
-		} else {
-			if (e.type != EXPR_TYPE_PIPE)
+			current_pipeline.push_back(*e.cmd);
+			next_token_must_be_command = false;
+			break;
+		case EXPR_TYPE_PIPE:
+			if (next_token_must_be_command)
 				return false;
-			next_segment_must_be_command = true;
+			next_token_must_be_command = true;
+			break;
+		case EXPR_TYPE_AND:
+		case EXPR_TYPE_OR:
+			if (next_token_must_be_command || current_pipeline.empty())
+				return false;
+			segments.push_back(std::move(current_pipeline));
+			current_pipeline.clear();
+			connectors.push_back(e.type);
+			next_token_must_be_command = true;
+			break;
+		default:
+			return false;
 		}
 	}
-	return !next_segment_must_be_command && !pipeline_commands.empty();
+
+	if (next_token_must_be_command || current_pipeline.empty())
+		return false;
+	segments.push_back(std::move(current_pipeline));
+	return connectors.size() + 1 == segments.size();
 }
 
 static int
@@ -102,13 +124,12 @@ open_redirect(const struct command_line *line)
 }
 
 static int
-run_pipeline(const struct command_line *line, bool job_is_background,
-	     bool *shell_should_exit, int *shell_exit_code)
+run_one_pipeline(const struct command_line *line,
+		 const std::vector<command> &pipeline_commands,
+		 bool job_is_background, bool exit_terminates_main_shell,
+		 bool apply_output_redirection, bool *shell_should_exit,
+		 int *shell_exit_code)
 {
-	std::vector<command> pipeline_commands;
-	if (!extract_pipeline(line, pipeline_commands))
-		return 1;
-
 	const size_t num_commands = pipeline_commands.size();
 
 	if (num_commands == 1 && pipeline_commands[0].exe == "cd" &&
@@ -116,13 +137,17 @@ run_pipeline(const struct command_line *line, bool job_is_background,
 		return builtin_cd(pipeline_commands[0]);
 
 	if (num_commands == 1 && pipeline_commands[0].exe == "exit") {
-		if (!job_is_background &&
+		if (exit_terminates_main_shell &&
 		    line->out_type == OUTPUT_TYPE_STDOUT) {
 			int code = parse_exit_code(pipeline_commands[0]);
-			*shell_should_exit = true;
-			*shell_exit_code = code;
+			if (shell_should_exit != NULL && shell_exit_code != NULL) {
+				*shell_should_exit = true;
+				*shell_exit_code = code;
+			}
 			return code;
 		}
+		if (!exit_terminates_main_shell)
+			_exit(parse_exit_code(pipeline_commands[0]));
 	}
 
 	std::vector<pid_t> child_pids;
@@ -174,7 +199,8 @@ run_pipeline(const struct command_line *line, bool job_is_background,
 				close(next_segment_pipe_write);
 			} else {
 				int redirect_fd = -1;
-				if (line->out_type != OUTPUT_TYPE_STDOUT) {
+				if (apply_output_redirection &&
+				    line->out_type != OUTPUT_TYPE_STDOUT) {
 					redirect_fd = open_redirect(line);
 					if (redirect_fd < 0)
 						_exit(1);
@@ -219,6 +245,51 @@ run_pipeline(const struct command_line *line, bool job_is_background,
 	return last_exit_status;
 }
 
+static int
+run_compound(const struct command_line *line,
+	     const std::vector<std::vector<command>> &segments,
+	     const std::vector<expr_type> &connectors,
+	     bool exit_terminates_main_shell, bool *shell_should_exit,
+	     int *shell_exit_code)
+{
+	auto seg_redir = [&](size_t seg_idx) -> bool {
+		if (connectors.empty())
+			return true;
+		return seg_idx + 1 == segments.size();
+	};
+
+	int accum = run_one_pipeline(line, segments[0], false,
+				     exit_terminates_main_shell,
+				     seg_redir(0), shell_should_exit,
+				     shell_exit_code);
+	if (shell_should_exit != NULL && *shell_should_exit)
+		return accum;
+
+	for (size_t i = 0; i < connectors.size(); ++i) {
+		if (connectors[i] == EXPR_TYPE_OR) {
+			if (accum != 0)
+				accum = run_one_pipeline(line, segments[i + 1],
+							 false,
+							 exit_terminates_main_shell,
+							 seg_redir(i + 1),
+							 shell_should_exit,
+							 shell_exit_code);
+		} else {
+			if (accum == 0)
+				accum = run_one_pipeline(line, segments[i + 1],
+							 false,
+							 exit_terminates_main_shell,
+							 seg_redir(i + 1),
+							 shell_should_exit,
+							 shell_exit_code);
+		}
+		if (shell_should_exit != NULL && *shell_should_exit)
+			return accum;
+	}
+
+	return accum;
+}
+
 static void
 execute_command_line(struct command_line *line, int *last_status,
 		     bool *shell_should_exit, int *shell_exit_code)
@@ -230,12 +301,33 @@ execute_command_line(struct command_line *line, int *last_status,
 		return;
 	}
 
-	bool job_is_background = line->is_background;
-	int pipeline_status =
-	    run_pipeline(line, job_is_background, shell_should_exit,
-			 shell_exit_code);
+	std::vector<std::vector<command>> segments;
+	std::vector<expr_type> connectors;
+	if (!parse_compound(line, segments, connectors)) {
+		*last_status = 1;
+		return;
+	}
+
+	if (line->is_background) {
+		pid_t worker = fork();
+		if (worker < 0) {
+			*last_status = 1;
+			return;
+		}
+		if (worker == 0) {
+			int st = run_compound(line, segments, connectors, false,
+					      NULL, NULL);
+			_exit(st & 255);
+		}
+		*last_status = 0;
+		return;
+	}
+
+	bool exit_terminates = !line->is_background;
+	int st = run_compound(line, segments, connectors, exit_terminates,
+			      shell_should_exit, shell_exit_code);
 	if (!*shell_should_exit)
-		*last_status = pipeline_status;
+		*last_status = st;
 }
 
 int
