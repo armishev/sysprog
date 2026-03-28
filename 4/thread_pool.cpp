@@ -196,7 +196,7 @@ int
 thread_task_delete(struct thread_task *task)
 {
 	pthread_mutex_lock(&task->state_mu);
-	if (task->attached_to_pool) {
+	if (task->ever_pushed && !task->join_completed) {
 		pthread_mutex_unlock(&task->state_mu);
 		return TPOOL_ERR_TASK_IN_POOL;
 	}
