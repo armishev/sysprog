@@ -1,5 +1,9 @@
 #include "thread_pool.h"
 
+#include <cerrno>
+#include <cmath>
+#include <ctime>
+
 #include <deque>
 #include <pthread.h>
 #include <vector>
@@ -13,7 +17,25 @@ struct thread_task {
 	bool running_body;
 	bool execution_done;
 	bool join_completed;
+#if NEED_DETACH
+	bool detached;
+	int join_pending;
+	pthread_cond_t drain_cv;
+#endif
 };
+
+static void
+timespec_add_seconds(struct timespec *ts, double sec)
+{
+	time_t add_s = static_cast<time_t>(std::floor(sec));
+	long add_ns = static_cast<long>((sec - std::floor(sec)) * 1e9);
+	ts->tv_sec += add_s;
+	ts->tv_nsec += add_ns;
+	if (ts->tv_nsec >= 1000000000L) {
+		ts->tv_sec += ts->tv_nsec / 1000000000L;
+		ts->tv_nsec %= 1000000000L;
+	}
+}
 
 struct thread_pool {
 	int max_threads;
@@ -58,7 +80,21 @@ worker_main(void *arg)
 		task->execution_done = true;
 		task->attached_to_pool = false;
 		pthread_cond_broadcast(&task->completion_cv);
+#if NEED_DETACH
+		if (task->detached) {
+			while (task->join_pending > 0)
+				pthread_cond_wait(&task->drain_cv, &task->state_mu);
+		}
+#endif
 		pthread_mutex_unlock(&task->state_mu);
+#if NEED_DETACH
+		if (task->detached) {
+			pthread_mutex_destroy(&task->state_mu);
+			pthread_cond_destroy(&task->completion_cv);
+			pthread_cond_destroy(&task->drain_cv);
+			delete task;
+		}
+#endif
 	}
 }
 
@@ -116,6 +152,9 @@ thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 	task->join_completed = false;
 	task->attached_to_pool = true;
 	task->ever_pushed = true;
+#if NEED_DETACH
+	task->detached = false;
+#endif
 	pthread_mutex_unlock(&task->state_mu);
 
 	pool->queue.push_back(task);
@@ -143,6 +182,11 @@ thread_task_new(struct thread_task **task, const thread_task_f &function)
 	t->running_body = false;
 	t->execution_done = false;
 	t->join_completed = false;
+#if NEED_DETACH
+	t->detached = false;
+	t->join_pending = 0;
+	pthread_cond_init(&t->drain_cv, NULL);
+#endif
 	*task = t;
 	return 0;
 }
@@ -173,8 +217,41 @@ thread_task_join(struct thread_task *task)
 		pthread_mutex_unlock(&task->state_mu);
 		return TPOOL_ERR_TASK_NOT_PUSHED;
 	}
-	while (!task->execution_done)
+#if NEED_DETACH
+	if (task->detached) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_INVALID_ARGUMENT;
+	}
+#endif
+	if (task->execution_done) {
+		task->join_completed = true;
+		pthread_mutex_unlock(&task->state_mu);
+		return 0;
+	}
+#if NEED_DETACH
+	task->join_pending++;
+#endif
+	while (!task->execution_done) {
 		pthread_cond_wait(&task->completion_cv, &task->state_mu);
+#if NEED_DETACH
+		if (task->detached) {
+			task->join_pending--;
+			pthread_cond_broadcast(&task->drain_cv);
+			pthread_mutex_unlock(&task->state_mu);
+			return TPOOL_ERR_INVALID_ARGUMENT;
+		}
+#endif
+	}
+#if NEED_DETACH
+	if (task->detached) {
+		task->join_pending--;
+		pthread_cond_broadcast(&task->drain_cv);
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_INVALID_ARGUMENT;
+	}
+	task->join_pending--;
+	pthread_cond_broadcast(&task->drain_cv);
+#endif
 	task->join_completed = true;
 	pthread_mutex_unlock(&task->state_mu);
 	return 0;
@@ -185,9 +262,86 @@ thread_task_join(struct thread_task *task)
 int
 thread_task_timed_join(struct thread_task *task, double timeout)
 {
-	(void)task;
-	(void)timeout;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&task->state_mu);
+	if (!task->ever_pushed) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+#if NEED_DETACH
+	if (task->detached) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_INVALID_ARGUMENT;
+	}
+#endif
+	if (task->execution_done) {
+		task->join_completed = true;
+		pthread_mutex_unlock(&task->state_mu);
+		return 0;
+	}
+
+	if (timeout <= 0 || std::isnan(timeout)) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_TIMEOUT;
+	}
+
+	if ((std::isinf(timeout) && timeout > 0) ||
+	    (std::isfinite(timeout) && timeout > 1e12)) {
+		pthread_mutex_unlock(&task->state_mu);
+		return thread_task_join(task);
+	}
+
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	timespec_add_seconds(&deadline, timeout);
+
+#if NEED_DETACH
+	task->join_pending++;
+#endif
+	while (!task->execution_done) {
+#if NEED_DETACH
+		if (task->detached) {
+			task->join_pending--;
+			pthread_cond_broadcast(&task->drain_cv);
+			pthread_mutex_unlock(&task->state_mu);
+			return TPOOL_ERR_INVALID_ARGUMENT;
+		}
+#endif
+		struct timespec now;
+		clock_gettime(CLOCK_REALTIME, &now);
+		if (now.tv_sec > deadline.tv_sec ||
+		    (now.tv_sec == deadline.tv_sec &&
+		     now.tv_nsec >= deadline.tv_nsec)) {
+#if NEED_DETACH
+			task->join_pending--;
+			pthread_cond_broadcast(&task->drain_cv);
+#endif
+			pthread_mutex_unlock(&task->state_mu);
+			return TPOOL_ERR_TIMEOUT;
+		}
+		int rc = pthread_cond_timedwait(&task->completion_cv,
+						&task->state_mu, &deadline);
+		if (rc == ETIMEDOUT) {
+#if NEED_DETACH
+			task->join_pending--;
+			pthread_cond_broadcast(&task->drain_cv);
+#endif
+			pthread_mutex_unlock(&task->state_mu);
+			return TPOOL_ERR_TIMEOUT;
+		}
+	}
+#if NEED_DETACH
+	if (task->detached) {
+		task->join_pending--;
+		pthread_cond_broadcast(&task->drain_cv);
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_INVALID_ARGUMENT;
+	}
+	task->join_pending--;
+	pthread_cond_broadcast(&task->drain_cv);
+#endif
+	task->join_completed = true;
+	pthread_mutex_unlock(&task->state_mu);
+	return 0;
 }
 
 #endif
@@ -204,6 +358,9 @@ thread_task_delete(struct thread_task *task)
 
 	pthread_mutex_destroy(&task->state_mu);
 	pthread_cond_destroy(&task->completion_cv);
+#if NEED_DETACH
+	pthread_cond_destroy(&task->drain_cv);
+#endif
 	delete task;
 	return 0;
 }
@@ -213,8 +370,28 @@ thread_task_delete(struct thread_task *task)
 int
 thread_task_detach(struct thread_task *task)
 {
-	(void)task;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&task->state_mu);
+	if (!task->ever_pushed) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+	if (task->execution_done) {
+		while (task->join_pending > 0)
+			pthread_cond_wait(&task->drain_cv, &task->state_mu);
+		pthread_mutex_unlock(&task->state_mu);
+		pthread_mutex_destroy(&task->state_mu);
+		pthread_cond_destroy(&task->completion_cv);
+		pthread_cond_destroy(&task->drain_cv);
+		delete task;
+		return 0;
+	}
+	if (task->detached) {
+		pthread_mutex_unlock(&task->state_mu);
+		return TPOOL_ERR_INVALID_ARGUMENT;
+	}
+	task->detached = true;
+	pthread_mutex_unlock(&task->state_mu);
+	return 0;
 }
 
 #endif
