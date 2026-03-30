@@ -83,19 +83,21 @@ worker_main(void *arg)
 		task->execution_done = true;
 		pthread_cond_broadcast(&task->completion_cv);
 #if NEED_DETACH
+		bool should_delete = false;
 		if (task->detached) {
 			while (task->join_pending > 0)
 				pthread_cond_wait(&task->drain_cv, &task->state_mu);
+			should_delete = true;
 		}
-#endif
 		pthread_mutex_unlock(&task->state_mu);
-#if NEED_DETACH
-		if (task->detached) {
+		if (should_delete) {
 			pthread_mutex_destroy(&task->state_mu);
 			pthread_cond_destroy(&task->completion_cv);
 			pthread_cond_destroy(&task->drain_cv);
 			delete task;
 		}
+#else
+		pthread_mutex_unlock(&task->state_mu);
 #endif
 	}
 }
